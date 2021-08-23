@@ -49,8 +49,14 @@ module sdram
 	input      [23:0] addr,       // 24 bit word address
 	input       [1:0] ds,         // upper/lower data strobe
 	input 		 		oe,         // cpu/chipset requests read
-	input 		 		we          // cpu/chipset requests write
+	input 		 		we,         // cpu/chipset requests write
+
+	input      [15:0] bios_din,			// BIOS upload data from MCU
+	output reg [15:0] bios_dout,			// BIOS output
+	input      [10:0] bios_addr,       // 24 bit word address
+	input 		 		bios_we          // BIOS upload strobe
 );
+
 
 localparam RASCAS_DELAY   = 3'd2;   // tRCD=20ns -> 3 cycles@128MHz
 localparam BURST_LENGTH   = 3'b000; // 000=1, 001=2, 010=4, 011=8
@@ -72,8 +78,8 @@ localparam MODE = { 3'b000, NO_WRITE_BURST, OP_MODE, CAS_LATENCY, ACCESS_TYPE, B
 localparam STATE_FIRST     = 3'd0;   // first state in cycle
 localparam STATE_CMD_START = 3'd1;   // state in which a new command can be started
 localparam STATE_CMD_CONT  = STATE_CMD_START + RASCAS_DELAY; // command can be continued
-localparam STATE_READ      = STATE_CMD_CONT + CAS_LATENCY + 4'd1;
-localparam STATE_HIGHZ     = STATE_READ - 4'd1; // disable output to prevent contention
+localparam STATE_READ      = STATE_CMD_CONT + CAS_LATENCY + 4'd2;
+localparam STATE_HIGHZ     = STATE_READ - 4'd2; // disable output to prevent contention
 
 
 // ---------------------------------------------------------------------
@@ -83,10 +89,13 @@ localparam STATE_HIGHZ     = STATE_READ - 4'd1; // disable output to prevent con
 // wait 1ms (32 8Mhz cycles) after FPGA config is done before going
 // into normal operation. Initialize the ram in the last 16 reset cycles (cycles 15-0)
 reg [4:0] reset;
-always @(posedge clk) begin
-	if(init)	reset <= 5'h1f;
-	else if((stage == STATE_FIRST) && (reset != 0))
-		reset <= reset - 5'd1;
+always @(posedge clk or posedge init) begin
+	if(init)
+		reset <= 5'h1f;
+	else begin
+		if((stage == STATE_FIRST) && (reset != 0))
+			reset <= reset - 5'd1;
+	end
 end
 
 // ---------------------------------------------------------------------
@@ -112,12 +121,24 @@ assign sd_ras = sd_cmd[2];
 assign sd_cas = sd_cmd[1];
 assign sd_we  = sd_cmd[0];
 
-// drive ram data lines when writing, set them as inputs otherwise
-assign sd_data = mode[1] ? din_r : 16'bZZZZZZZZZZZZZZZZ;
+reg active;
+reg port;
 
-reg  [1:0] mode;
+// drive ram data lines when writing, set them as inputs otherwise
+reg drive_dq;
+assign sd_data = drive_dq ? din_r : 16'bZZZZZZZZZZZZZZZZ;
+
+reg [15:0] sd_data_r;
+reg [15:0] bios_dout_r;
+reg [15:0] dout_r;
+
+reg old_oe;
 reg [15:0] din_r;
 reg  [2:0] stage;
+
+reg bios_oe;
+wire [23:0] bios_addr_ext = {13'b0,bios_addr};
+reg [10:0] bios_addr_d;
 
 always @(posedge clk) begin
 	reg [12:0] addr_r;
@@ -128,9 +149,16 @@ always @(posedge clk) begin
 
 	old_sync <= sync;
 	if(~old_sync & sync) stage <= 1;
-
+	
+	if(bios_addr!=bios_addr_d)
+		bios_oe<=1'b1;
+	else
+		bios_oe<=1'b0;
+	
 	sd_cmd <= CMD_INHIBIT;  // default: idle
 
+	sd_data_r<=sd_data;
+	
 	if(reset != 0) begin
 		// initialization takes place at the end of the reset phase
 		if(stage == STATE_CMD_START) begin
@@ -146,49 +174,76 @@ always @(posedge clk) begin
 			end
 			
 		end
-		mode    <= 0;
+		drive_dq<=1'b0;
+		active<=1'b0;
+		
+		bios_addr_d<=11'h7ff;
+//		bios_oe <= 1'b0;
+//		mode    <= 0;
 		sd_dqm  <= 2'b11;
 	end else begin
 
 		// normal operation
 		if(stage == STATE_CMD_START) begin
 			if(we || oe) begin
-
-				mode <= {we, oe};
+				port<=1'b0;
+				active<=1'b1;
+				drive_dq<=we;
 
 				// RAS phase
 				sd_cmd  <= CMD_ACTIVE;
-				sd_addr <= { 1'b0, addr[19:8] };
-				sd_ba   <= addr[21:20];
-
+				sd_addr <= { addr[21:9] };
+				sd_ba   <= {1'b0,addr[22]};
 				ds_r    <= ds;
 				din_r   <= din;
-				addr_r  <= { 4'b0010, addr[22], addr[7:0] };  // auto precharge
-			end
-			else begin
+				addr_r  <= { 4'b0010, addr[8:0] };  // auto precharge
+			end else if(bios_we || bios_oe) begin
+//			end else if(bios_we) begin
+				port<=1'b1;
+				active<=1'b1;
+				drive_dq<=bios_we;
+
+				// RAS phase
+				sd_cmd  <= CMD_ACTIVE;
+				sd_addr <= bios_addr_ext[21:9];
+				sd_ba   <= {1'b1,bios_addr_ext[22]};
+
+				ds_r    <= 2'b11;
+				din_r   <= bios_din;
+				addr_r  <= { 4'b0010, bios_addr_ext[8:0] };  // auto precharge
+			end else begin
+				drive_dq<=1'b0;
+				active<=1'b0;
 				sd_cmd <= CMD_AUTO_REFRESH;
-				mode <= 0;
 			end
 		end
 
 		// CAS phase 
-		if(stage == STATE_CMD_CONT && mode) begin
-			sd_cmd  <= mode[1] ? CMD_WRITE : CMD_READ;
+		if(stage == STATE_CMD_CONT && active) begin
+			sd_cmd  <= drive_dq ? CMD_WRITE : CMD_READ;
 			sd_addr <= addr_r;
 
-			if(mode[1]) sd_dqm <= ~ds_r;
-			else        sd_dqm <= 2'b00;
+			if(drive_dq) sd_dqm <= ~ds_r;
+			else         sd_dqm <= 2'b00;
 		end
 
 		if(stage == STATE_HIGHZ) begin
 			sd_dqm  <= 2'b11; // disable chip output
-			mode[1] <= 0;     // disable data output
+			drive_dq <= 1'b0; // disable data output
 		end
 
-		if(stage == STATE_READ && mode) begin
-			dout <= sd_data;
+		if(stage == STATE_READ && active) begin
+			if(port) begin
+				bios_dout_r<=sd_data_r;
+				bios_addr_d<=bios_addr;
+			end else
+				dout_r <= sd_data_r;
+			active<=1'b0;
 		end
 	end
 end
+
+assign dout = (active && !port) ? sd_data_r : dout_r;
+assign bios_dout = (active && port) ? sd_data_r : bios_dout_r;
 
 endmodule
