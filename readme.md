@@ -1,7 +1,10 @@
-Source code for Gameboy for MIST
-================================
+Gameboy for MiST
+================
+Ported to Turbo Chameleon 64 by Alastair M. Robinson
 
-This is source code of a gameboy implementation for the MIST. 
+
+
+This is the source code of a gameboy implementation for the MIST. 
 
 It's based on the [t80](http://opencores.org/project,t80) CPU core. A minor
 fix was needed for the "LD ($FF00+C)" instruction.

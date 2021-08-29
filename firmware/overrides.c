@@ -56,15 +56,17 @@ void fillram(int index,int size,int pattern)
 }
 
 
-const char *bootrom_name="GBC_BIOSBIN";
+const char *bootrom_name="GBC_BIOSBIN not found";
+const char *bootrom2_name="AUTOBOOTGB ";
 extern unsigned char romtype;
 char *autoboot()
 {
 	char *result=0;
 	romtype=0;
-	LoadROM(bootrom_name);
-//	fillram(0,16384,0x77665544);
-//	fillram(1,16384,0xffeeddcc);
+	if(!LoadROM(bootrom_name))
+		result=bootrom_name;
+	romtype=1;
+	LoadROM(bootrom2_name);
 	return(result);
 }
 
